@@ -2,6 +2,7 @@
 
 #include "storage/queued_country.hpp"
 
+#include "platform/downloader_utils.hpp"
 #include "platform/http_client.hpp"
 #include "platform/platform.hpp"
 #include "platform/servers_list.hpp"
@@ -21,22 +22,38 @@ void MapFilesDownloader::DownloadMapFile(QueuedCountry & queuedCountry)
     return;
   }
 
+  m_quarantine.Append(std::move(queuedCountry));
+
   if (!m_isServersListRequested)
   {
-    m_isServersListRequested = true;
+    RunServersListAsync([this]()
+    {
+      m_quarantine.ForEachCountry([this](QueuedCountry & country)
+      {
+        Download(country);
+      });
 
-    GetPlatform().RunTask(Platform::Thread::Network, [=]() mutable {
-      GetServersList([=](ServersList const & serversList) mutable {
-                      m_serversList = serversList;
-                      m_quarantine.ForEachCountry([=](QueuedCountry & country) mutable {
-                                                    Download(country);
-                                                  });
-                      m_quarantine.Clear();
-                    });
+      m_quarantine.Clear();
     });
   }
+}
 
-  m_quarantine.Append(std::move(queuedCountry));
+void MapFilesDownloader::RunServersListAsync(std::function<void()> && callback)
+{
+  m_isServersListRequested = true;
+
+  GetPlatform().RunTask(Platform::Thread::Network, [this, callback = std::move(callback)]()
+  {
+    GetServersList([this, callback = std::move(callback)](ServersList const & serversList)
+    {
+      m_serversList = serversList;
+
+      callback();
+
+      // Reset flag to invoke servers list downloading next time if current request has failed.
+      m_isServersListRequested = false;
+    });
+  });
 }
 
 void MapFilesDownloader::Remove(CountryId const & id)
@@ -68,11 +85,48 @@ void MapFilesDownloader::UnsubscribeAll()
 }
 
 // static
-std::string MapFilesDownloader::MakeFullUrlLegacy(std::string const & baseUrl,
-                                                  std::string const & fileName, int64_t dataVersion)
+std::string MapFilesDownloader::MakeFullUrlLegacy(std::string const & baseUrl, std::string const & fileName, int64_t dataVersion)
 {
-  return url::Join(baseUrl, OMIM_OS_NAME, strings::to_string(dataVersion),
-                           url::UrlEncode(fileName));
+  return url::Join(baseUrl, downloader::GetFileDownloadUrl(fileName, dataVersion));
+}
+
+void MapFilesDownloader::DownloadAsString(std::string url, bool firstPass, std::function<bool (std::string const &)> && callback)
+{
+  auto doDownload = [this, firstPass, url = std::move(url), callback = std::move(callback)]()
+  {
+    if ((m_fileRequest && firstPass) || m_serversList.empty())
+      return;
+
+    m_fileRequest.reset(RequestT::Get(url::Join(m_serversList.back(), url),
+      [this, callback = std::move(callback)](RequestT & request)
+      {
+        bool deleteRequest = true;
+
+        auto const & buffer = request.GetData();
+        if (!buffer.empty())
+        {
+          // Update deleteRequest flag if new download was requested in callback.
+          deleteRequest = !callback(buffer);
+        }
+
+        if (deleteRequest)
+          m_fileRequest.reset();
+      }));
+  };
+
+  /// @todo Implement logic if m_serversList is "outdated"?
+  if (!m_serversList.empty())
+  {
+    doDownload();
+  }
+  else if (!m_isServersListRequested)
+  {
+    RunServersListAsync(std::move(doDownload));
+  }
+  else
+  {
+    // skip this request without callback call
+  }
 }
 
 void MapFilesDownloader::SetServersList(ServersList const & serversList)

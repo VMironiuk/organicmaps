@@ -58,8 +58,15 @@ public:
   void Subscribe(Subscriber * subscriber);
   void UnsubscribeAll();
 
-  static std::string MakeFullUrlLegacy(std::string const & baseUrl, std::string const & fileName,
-                                       int64_t dataVersion);
+  static std::string MakeFullUrlLegacy(std::string const & baseUrl, std::string const & fileName, int64_t dataVersion);
+
+  /**
+   * @brief Async file download as string buffer (for small files only).
+   * Request can be skipped if current servers list is empty.
+   * Callback will be skipped if download error.
+   * @param[in]  url Final url part like "index.json" or "maps/210415/countries.txt".
+   */
+  void DownloadAsString(std::string url, bool firstPass, std::function<bool (std::string const &)> && callback);
 
   void SetServersList(ServersList const & serversList);
   void SetDownloadingPolicy(DownloadingPolicy * policy);
@@ -74,15 +81,26 @@ protected:
   std::vector<Subscriber *> m_subscribers;
 
 private:
-  /// NOTE: this method will be called on network thread.
-  /// Default implementation receives a list of all servers that can be asked
-  /// for a map file and invokes callback on the main thread.
+  /**
+   * @brief This method is blocking and should be called on network thread.
+   * Default implementation receives a list of all servers that can be asked
+   * for a map file and invokes callback on the main thread (@see ServersListCallback as SafeCallback).
+   */
   virtual void GetServersList(ServersListCallback const & callback);
   /// Asynchronously downloads the file and saves result to provided directory.
   virtual void Download(QueuedCountry & queuedCountry) = 0;
 
+  /// @param[in]  callback  Called in main thread (@see GetServersList).
+  void RunServersListAsync(std::function<void()> && callback);
+
+  /// Needed for DownloadAsString.
+  using RequestT = downloader::HttpRequest;
+  std::unique_ptr<RequestT> m_fileRequest;
+
   ServersList m_serversList;
-  bool m_isServersListRequested = false;
+  /// Used as guard for m_serversList assign.
+  std::atomic_bool m_isServersListRequested = false;
+
   DownloadingPolicy * m_downloadingPolicy = nullptr;
 
   // This queue accumulates download requests before
